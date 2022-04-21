@@ -30,9 +30,10 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
-from .helpers import build_model_with_cfg, resolve_pretrained_cfg, named_apply, adapt_input_conv, checkpoint_seq
+from .helpers import build_model_with_cfg, pretrained_cfg_for_features, resolve_pretrained_cfg, named_apply, adapt_input_conv, checkpoint_seq
 from .layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_
 from .registry import register_model
+from .features import FeatureInfo, FeatureHooks
 
 _logger = logging.getLogger(__name__)
 
@@ -434,6 +435,43 @@ class VisionTransformer(nn.Module):
         x = self.forward_head(x)
         return x
 
+class VisionTransformerFeatures(VisionTransformer):
+    def __init__(self, img_size=224, out_indices=(0, 1, 2, 3), patch_size=16, in_chans=3, num_classes=1000, global_pool='token', embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True, representation_size=None, drop_rate=0, attn_drop_rate=0, drop_path_rate=0, weight_init='', init_values=None, embed_layer=PatchEmbed, norm_layer=None, act_layer=None, block_fn=Block):
+        super().__init__(img_size, patch_size, in_chans, num_classes, global_pool, embed_dim, depth, num_heads, mlp_ratio, qkv_bias, representation_size, drop_rate, attn_drop_rate, drop_path_rate, weight_init, init_values, embed_layer, norm_layer, act_layer, block_fn)
+        # add deconvolution layers
+        self.deconvs_1 = nn.ConvTranspose2d(embed_dim, embed_dim // 4, kernel_size=4, stride=4, padding=0)
+        self.deconvs_2 = nn.ConvTranspose2d(embed_dim, embed_dim // 4, kernel_size=4, stride=2, padding=1)
+        self.deconvs_3 = nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=3, stride=1, padding=1)
+        self.deconvs_4 = nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=3, stride=2, padding=1)
+        self.feature_info = [
+            dict(
+                module=f'deconvs_{idx + 1}', num_chs=embed_dim // 4, stage=0, reduction=2 ** (idx + 2),
+            ) for idx in out_indices
+        ]
+        self.feature_info = FeatureInfo(self.feature_info, out_indices)
+        self.fc_norm, self.pre_logits, self.head = nn.Identity(), nn.Identity(), nn.Identity()
+        
+    def forward(self, x):
+        x = self.patch_embed(x)
+        x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
+        x = self.pos_drop(x + self.pos_embed)
+        if self.grad_checkpointing and not torch.jit.is_scripting():
+            x = checkpoint_seq(self.blocks, x)
+        else:
+            x = self.blocks(x)
+
+        # import pdb; pdb.set_trace()
+        x = self.norm(x)
+        x = x[:, 1:, :] # remove the cls token 
+        x = x.permute(0, 2, 1)
+        B, C, L = x.shape 
+        x = x.view(B, C, int(math.sqrt(L)), int(math.sqrt(L)))
+        deconv_1 = self.deconvs_1(x)
+        deconv_2 = self.deconvs_2(x)
+        deconv_3 = self.deconvs_3(x)
+        deconv_4 = self.deconvs_4(x)
+        return [deconv_1, deconv_2, deconv_3, deconv_4]
+    
 
 def init_weights_vit_timm(module: nn.Module, name: str = ''):
     """ ViT weight initialization, original timm impl (for reproducibility) """
@@ -606,9 +644,14 @@ def checkpoint_filter_fn(state_dict, model):
 
 
 def _create_vision_transformer(variant, pretrained=False, **kwargs):
-    if kwargs.get('features_only', None):
-        raise RuntimeError('features_only not implemented for Vision Transformer models.')
 
+    features_only = False
+    model_cls = VisionTransformer
+    kwargs_filter = None
+    if kwargs.pop('features_only', False):
+        # raise RuntimeError('features_only not implemented for Vision Transformer models.')
+        features_only = True
+        model_cls = VisionTransformerFeatures
     # NOTE this extra code to support handling of repr size for in21k pretrained models
     pretrained_cfg = resolve_pretrained_cfg(variant, kwargs=kwargs)
     default_num_classes = pretrained_cfg['num_classes']
@@ -621,12 +664,14 @@ def _create_vision_transformer(variant, pretrained=False, **kwargs):
         repr_size = None
 
     model = build_model_with_cfg(
-        VisionTransformer, variant, pretrained,
+        model_cls, variant, pretrained,
         pretrained_cfg=pretrained_cfg,
         representation_size=repr_size,
         pretrained_filter_fn=checkpoint_filter_fn,
         pretrained_custom_load='npz' in pretrained_cfg['url'],
         **kwargs)
+    if features_only:
+        model.default_cfg = pretrained_cfg_for_features(model.default_cfg)
     return model
 
 
