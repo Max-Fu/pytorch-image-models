@@ -65,9 +65,11 @@ default_cfgs = {
         url='https://storage.googleapis.com/vit_models/augreg/'
             'S_32-i21k-300ep-lr_0.001-aug_light1-wd_0.03-do_0.0-sd_0.0--imagenet2012-steps_20k-lr_0.03-res_384.npz',
         input_size=(3, 384, 384), crop_pct=1.0),
+    # 'vit_small_patch16_224': _cfg(
+    #     url='https://storage.googleapis.com/vit_models/augreg/'
+    #         'S_16-i21k-300ep-lr_0.001-aug_light1-wd_0.03-do_0.0-sd_0.0--imagenet2012-steps_20k-lr_0.03-res_224.npz'),
     'vit_small_patch16_224': _cfg(
-        url='https://storage.googleapis.com/vit_models/augreg/'
-            'S_16-i21k-300ep-lr_0.001-aug_light1-wd_0.03-do_0.0-sd_0.0--imagenet2012-steps_20k-lr_0.03-res_224.npz'),
+        url='https://www.dropbox.com/s/51fasmar8hjfpeh/mae_pretrain_hoi_vit_small.pth?dl=1', crop_pct=1.0),
     'vit_small_patch16_384': _cfg(
         url='https://storage.googleapis.com/vit_models/augreg/'
             'S_16-i21k-300ep-lr_0.001-aug_light1-wd_0.03-do_0.0-sd_0.0--imagenet2012-steps_20k-lr_0.03-res_384.npz',
@@ -436,16 +438,49 @@ class VisionTransformer(nn.Module):
         return x
 
 class VisionTransformerFeatures(VisionTransformer):
-    def __init__(self, img_size=224, out_indices=(0, 1, 2, 3), patch_size=16, in_chans=3, num_classes=1000, global_pool='token', embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True, representation_size=None, drop_rate=0, attn_drop_rate=0, drop_path_rate=0, weight_init='', init_values=None, embed_layer=PatchEmbed, norm_layer=None, act_layer=None, block_fn=Block):
+    def __init__(self, img_size=224, out_indices=(0, 1, 2, 3), patch_size=16, in_chans=3, num_classes=1000, global_pool='token', embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True, representation_size=None, drop_rate=0, attn_drop_rate=0, drop_path_rate=0, weight_init='', init_values=None, embed_layer=PatchEmbed, norm_layer=None, act_layer=None, block_fn=Block, intermediate_channels = 256):
         super().__init__(img_size, patch_size, in_chans, num_classes, global_pool, embed_dim, depth, num_heads, mlp_ratio, qkv_bias, representation_size, drop_rate, attn_drop_rate, drop_path_rate, weight_init, init_values, embed_layer, norm_layer, act_layer, block_fn)
-        # add deconvolution layers
-        self.deconvs_1 = nn.ConvTranspose2d(embed_dim, embed_dim // 4, kernel_size=4, stride=4, padding=0)
-        self.deconvs_2 = nn.ConvTranspose2d(embed_dim, embed_dim // 4, kernel_size=4, stride=2, padding=1)
-        self.deconvs_3 = nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=3, stride=1, padding=1)
-        self.deconvs_4 = nn.Conv2d(embed_dim, embed_dim // 4, kernel_size=3, stride=2, padding=1)
+        
+        self.intermediate_channels = intermediate_channels
+
+        feature_map_w, feature_map_h = self.patch_embed.grid_size
+        self.deconvs_1 = nn.Sequential(
+            nn.ConvTranspose2d(embed_dim, embed_dim, kernel_size=2, stride=2),
+            nn.LayerNorm([embed_dim, feature_map_w * 2, feature_map_h * 2]), 
+            nn.GELU(),
+            nn.ConvTranspose2d(embed_dim, embed_dim, kernel_size=2, stride=2), 
+            nn.Conv2d(embed_dim, self.intermediate_channels, kernel_size=1, stride=1, padding="same"),
+            nn.LayerNorm([self.intermediate_channels, feature_map_w * 4, feature_map_h * 4]),
+            nn.Conv2d(self.intermediate_channels, self.intermediate_channels, kernel_size=3, stride=1, padding="same"),
+            nn.LayerNorm([self.intermediate_channels, feature_map_w * 4, feature_map_h * 4]),
+        )
+
+        self.deconvs_2 = nn.Sequential(
+            nn.ConvTranspose2d(embed_dim, embed_dim, kernel_size=2, stride=2, padding=0),
+            nn.Conv2d(embed_dim, self.intermediate_channels, kernel_size=1, stride=1, padding="same"),
+            nn.LayerNorm([self.intermediate_channels, feature_map_w * 2, feature_map_h * 2]),
+            nn.Conv2d(self.intermediate_channels, self.intermediate_channels, kernel_size=3, stride=1, padding="same"),
+            nn.LayerNorm([self.intermediate_channels, feature_map_w * 2, feature_map_h * 2]),
+        )
+
+        self.deconvs_3 = nn.Sequential(
+            nn.Conv2d(embed_dim, self.intermediate_channels, kernel_size=1, stride=1, padding="same"),
+            nn.LayerNorm([self.intermediate_channels, feature_map_w, feature_map_h]),
+            nn.Conv2d(self.intermediate_channels, self.intermediate_channels, kernel_size=3, stride=1, padding="same"),
+            nn.LayerNorm([self.intermediate_channels, feature_map_w, feature_map_h]),
+        )
+
+        self.deconvs_4 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(embed_dim, self.intermediate_channels, kernel_size=1, stride=1, padding="same"),
+            nn.LayerNorm([self.intermediate_channels, feature_map_w // 2, feature_map_h // 2]),
+            nn.Conv2d(self.intermediate_channels, self.intermediate_channels, kernel_size=3, stride=1, padding="same"),
+            nn.LayerNorm([self.intermediate_channels, feature_map_w // 2, feature_map_h // 2]),
+        )
+
         self.feature_info = [
             dict(
-                module=f'deconvs_{idx + 1}', num_chs=embed_dim // 4, stage=0, reduction=2 ** (idx + 2),
+                module=f'deconvs_{idx + 1}', num_chs=self.intermediate_channels, stage=0, reduction=2 ** (idx + 2),
             ) for idx in out_indices
         ]
         self.feature_info = FeatureInfo(self.feature_info, out_indices)
@@ -460,7 +495,6 @@ class VisionTransformerFeatures(VisionTransformer):
         else:
             x = self.blocks(x)
 
-        # import pdb; pdb.set_trace()
         x = self.norm(x)
         x = x[:, 1:, :] # remove the cls token 
         x = x.permute(0, 2, 1)
